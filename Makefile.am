@@ -1467,7 +1467,9 @@ ad_access_filter_tests_LDADD = \
     libsss_ldap_common.la \
     libsss_idmap.la \
     libsss_krb5_common.la \
+    libsss_ad.la \
     libsss_test_common.la
+
 
 ad_common_tests_SOURCES = \
     $(sssd_be_SOURCES) \
@@ -1825,6 +1827,8 @@ libsss_ad_la_SOURCES = \
     src/providers/ad/ad_id.h \
     src/providers/ad/ad_access.c \
     src/providers/ad/ad_access.h \
+    src/providers/ad/ad_gpo.c \
+    src/providers/ad/ad_gpo.h \
     src/providers/ad/ad_opts.h \
     src/providers/ad/ad_srv.c \
     src/providers/ad/ad_subdomains.c \
