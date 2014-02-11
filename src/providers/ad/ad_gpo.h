@@ -23,58 +23,29 @@
 #ifndef AD_GPO_H_
 #define AD_GPO_H_
 
+
+/* 
+ * This pair of functions provides client-side GPO processing.
+ *
+ * A GPO overview is at https://fedorahosted.org/sssd/wiki/GpoOverview
+ *
+ * In summary, client-side processing involves:
+ * - determining the target computer's DN
+ * - extracting the SOM object DNs (i.e. OUs and Domain) from target's DN
+ * - including the target's Site as another SOM object
+ * - determining which GPOs apply to the target's SOMs
+ * - prioritizing GPOs based on SOM, link order, and whether GPO is "enforced"
+ * - retrieving the corresponding GPO objects
+ * - sending the GPO DNs to the CSE processing engine for policy application
+ *
+ */
 struct tevent_req *
 ad_gpo_access_send(TALLOC_CTX *mem_ctx,
 		   struct tevent_context *ev,
-		   struct be_ctx *be_ctx,
 		   struct sss_domain_info *domain,
-		   struct ad_access_ctx *ctx,
-		   struct pam_data *pd);
+		   struct ad_access_ctx *ctx);
 
 errno_t ad_gpo_access_recv(struct tevent_req *req);
 
-
-/* following types are copied from git/samba/libgpo/gpo.h */
-enum GPO_LINK_TYPE {
-	GP_LINK_UNKOWN	= 0,
-	GP_LINK_MACHINE	= 1,
-	GP_LINK_SITE	= 2,
-	GP_LINK_DOMAIN	= 3,
-	GP_LINK_OU	= 4,
-	GP_LINK_LOCAL	= 5 /* for convenience */
-};
-
-struct GROUP_POLICY_OBJECT {
-	uint32_t options;	/* GPFLAGS_* */
-	uint32_t version;
-	const char *ds_path;
-	const char *file_sys_path;
-	const char *display_name;
-	const char *name;
-	const char *link;
-	enum GPO_LINK_TYPE link_type;
-	const char *user_extensions;
-	const char *machine_extensions;
-  /*struct security_descriptor *security_descriptor;*/
-	struct GROUP_POLICY_OBJECT *next, *prev;
-};
-
-struct GP_LINK {
-	const char *gp_link;	/* raw link name */
-	uint32_t gp_opts;	/* inheritance options GPO_INHERIT */
-	uint32_t num_links;	/* number of links */
-	char **link_names;	/* array of parsed link names */
-	uint32_t *link_opts;	/* array of parsed link opts GPO_LINK_OPT_* */
-};
-
-struct GP_EXT {
-	const char *gp_extension;	/* raw extension name */
-	uint32_t num_exts;
-	char **extensions;
-	char **extensions_guid;
-	char **snapins;
-	char **snapins_guid;
-	struct GP_EXT *next, *prev;
-};
 
 #endif /* AD_GPO_H_ */

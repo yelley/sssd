@@ -255,7 +255,6 @@ ad_access_send(TALLOC_CTX *mem_ctx,
     struct tevent_req *req;
     struct ad_access_state *state;
     errno_t ret;
-    DEBUG(1, ("YKE\n"));
     req = tevent_req_create(mem_ctx, &state, struct ad_access_state);
     if (req == NULL) {
         return NULL;
@@ -302,7 +301,6 @@ ad_sdap_access_step(struct tevent_req *req, struct sdap_id_conn_ctx *conn)
     struct tevent_req *subreq;
     struct ad_access_state *state;
     struct sdap_access_ctx *req_ctx;
-    DEBUG(1, ("YKE\n"));
     state = tevent_req_data(req, struct ad_access_state);
 
     req_ctx = talloc(state, struct sdap_access_ctx);
@@ -335,7 +333,6 @@ ad_sdap_access_done(struct tevent_req *subreq)
     struct tevent_req *req;
     struct ad_access_state *state;
     errno_t ret;
-    DEBUG(1, ("YKE\n"));
     req = tevent_req_callback_data(subreq, struct tevent_req);
     state = tevent_req_data(req, struct ad_access_state);
 
@@ -345,10 +342,8 @@ ad_sdap_access_done(struct tevent_req *subreq)
     if (ret == EOK) {
       subreq = ad_gpo_access_send(state, 
 				  state->be_ctx->ev,
-				  state->be_ctx,
 				  state->domain,
-				  state->ctx,
-				  state->pd);
+				  state->ctx);
 
       if (!subreq) {
         tevent_req_error(req, ENOMEM);
@@ -397,7 +392,6 @@ ad_sdap_access_done(struct tevent_req *subreq)
 static errno_t
 ad_access_recv(struct tevent_req *req)
 {
-    DEBUG(1, ("YKE\n"));
     TEVENT_REQ_RETURN_ON_ERROR(req);
 
     return EOK;
@@ -407,11 +401,9 @@ static void
 ad_gpo_access_done(struct tevent_req *subreq)
 {
     struct tevent_req *req;
-    struct ad_access_state *state;
     errno_t ret;
-    DEBUG(1, ("YKE\n"));
     req = tevent_req_callback_data(subreq, struct tevent_req);
-    state = tevent_req_data(req, struct ad_access_state);
+
     ret = ad_gpo_access_recv(subreq);
     talloc_zfree(subreq);
 
@@ -420,7 +412,6 @@ ad_gpo_access_done(struct tevent_req *subreq)
     } else {
       tevent_req_error(req, ret);
     }
-    return;
 }
 
 
@@ -439,7 +430,6 @@ ad_access_handler(struct be_req *breq)
                     talloc_get_type(be_req_get_data(breq), struct pam_data);
     struct sss_domain_info *domain;
 
-    DEBUG(1, ("YKE\n"));
     /* Handle subdomains */
     if (strcasecmp(pd->domain, be_ctx->domain->name) != 0) {
         domain = find_subdomain_by_name(be_ctx->domain, pd->domain, true);
@@ -452,7 +442,7 @@ ad_access_handler(struct be_req *breq)
         domain = be_ctx->domain;
     }
 
-    /* Verify that the account is not locked */
+    /* Verify access control aspects: locked accounts, ldap policies, GPOs, etc */
     req = ad_access_send(breq, be_ctx->ev, be_ctx, domain,
                          access_ctx, pd);
     if (!req) {
@@ -470,7 +460,6 @@ ad_access_done(struct tevent_req *req)
             tevent_req_callback_data(req, struct be_req);
     struct pam_data *pd =
                     talloc_get_type(be_req_get_data(breq), struct pam_data);
-    DEBUG(1, ("YKE\n"));
     ret = ad_access_recv(req);
     talloc_zfree(req);
     switch (ret) {
