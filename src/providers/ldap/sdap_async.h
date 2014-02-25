@@ -210,6 +210,19 @@ int sdap_deref_search_recv(struct tevent_req *req,
                            size_t *reply_count,
                            struct sdap_deref_attrs ***reply);
 
+struct tevent_req *
+sdap_sd_search_send(TALLOC_CTX *memctx, 
+		    struct tevent_context *ev,
+		    struct sdap_options *opts,
+		    struct sdap_handle *sh,
+		    const char *base_dn,
+		    int sd_flags,
+		    const char **attrs, 
+		    int timeout);
+int sdap_sd_search_recv(struct tevent_req *req,
+			TALLOC_CTX *mem_ctx,
+			size_t *reply_count,
+			struct sysdb_attrs ***reply);
 errno_t
 sdap_attrs_add_ldap_attr(struct sysdb_attrs *ldap_attrs,
                          const char *attr_name,

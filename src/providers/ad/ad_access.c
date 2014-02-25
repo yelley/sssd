@@ -339,54 +339,55 @@ ad_sdap_access_done(struct tevent_req *subreq)
     ret = sdap_access_recv(subreq);
     talloc_zfree(subreq);
 
-    if (ret == EOK) {
-      subreq = ad_gpo_access_send(state, 
-				  state->be_ctx->ev,
-				  state->domain,
-				  state->ctx);
+    if (ret != EOK) {
+        switch (ret) {
+        case ERR_ACCOUNT_EXPIRED:
+            tevent_req_error(req, ret);
+            return;
 
-      if (!subreq) {
+        case ERR_ACCESS_DENIED:
+            /* Retry on ACCESS_DENIED, too, to make sure that we don't
+             * miss out any attributes not present in GC
+             * FIXME - this is slow. We should retry only if GC failed
+             * and LDAP succeeded after the first ACCESS_DENIED
+             */
+            break;
+
+        default:
+            break;
+        }
+
+        /* If possible, retry with LDAP */
+        state->cindex++;
+        if (state->clist[state->cindex] == NULL) {
+            DEBUG(SSSDBG_OP_FAILURE,
+                  ("Error retrieving access check result: %s\n",
+                   sss_strerror(ret)));
+            tevent_req_error(req, ret);
+            return;
+        }
+
+        ret = ad_sdap_access_step(req, state->clist[state->cindex]);
+        if (ret != EOK) {
+            tevent_req_error(req, ret);
+            return;
+        }
+
+        /* Another check in progress */
+    }
+
+    subreq = ad_gpo_access_send(state, 
+                                state->be_ctx->ev,
+                                state->domain,
+                                state->ctx,
+                                state->pd->user);
+
+    if (!subreq) {
         tevent_req_error(req, ENOMEM);
         return;
-      }
-      
-      tevent_req_set_callback(subreq, ad_gpo_access_done, req);
-    } else {
-      switch (ret) {
-      case ERR_ACCOUNT_EXPIRED:
-        tevent_req_error(req, ret);
-        return;
-
-      case ERR_ACCESS_DENIED:
-        /* Retry on ACCESS_DENIED, too, to make sure that we don't
-         * miss out any attributes not present in GC
-         * FIXME - this is slow. We should retry only if GC failed
-         * and LDAP succeeded after the first ACCESS_DENIED
-         */
-        break;
-
-      default:
-        break;
-      }
-
-      /* If possible, retry with LDAP */
-      state->cindex++;
-      if (state->clist[state->cindex] == NULL) {
-        DEBUG(SSSDBG_OP_FAILURE,
-	      ("Error retrieving access check result: %s\n",
-	       sss_strerror(ret)));
-        tevent_req_error(req, ret);
-        return;
-      }
-
-      ret = ad_sdap_access_step(req, state->clist[state->cindex]);
-      if (ret != EOK) {
-        tevent_req_error(req, ret);
-        return;
-      }
-
-      /* Another check in progress */
     }
+      
+    tevent_req_set_callback(subreq, ad_gpo_access_done, req);
 }
 
 static errno_t
@@ -442,7 +443,7 @@ ad_access_handler(struct be_req *breq)
         domain = be_ctx->domain;
     }
 
-    /* Verify access control aspects: locked accounts, ldap policies, GPOs, etc */
+    /* Verify access control: locked accounts, ldap policies, GPOs, etc */
     req = ad_access_send(breq, be_ctx->ev, be_ctx, domain,
                          access_ctx, pd);
     if (!req) {
