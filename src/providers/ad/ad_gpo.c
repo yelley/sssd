@@ -24,15 +24,16 @@
 */
 
 #include <security/pam_modules.h>
-#include "src/util/util.h"
-#include "src/providers/data_provider.h"
-#include "src/providers/dp_backend.h"
-#include "src/providers/ad/ad_access.h"
-#include "src/providers/ad/ad_common.h"
-#include "src/providers/ad/ad_gpo.h"
-#include "src/providers/ldap/sdap_access.h"
-#include "src/providers/ldap/sdap_async.h"
-#include "src/providers/ldap/sdap.h"
+#include "util/util.h"
+#include "providers/data_provider.h"
+#include "providers/dp_backend.h"
+#include "providers/ad/ad_access.h"
+#include "providers/ad/ad_common.h"
+#include "providers/ad/ad_domain_info.h"
+#include "providers/ad/ad_gpo.h"
+#include "providers/ldap/sdap_access.h"
+#include "providers/ldap/sdap_async.h"
+#include "providers/ldap/sdap.h"
 
 #define AD_AT_DN "distinguishedName"
 #define AD_AT_GPLINK "gPLink"
@@ -50,11 +51,13 @@
 #define AD_AT_OBJECT_CLASS "objectClass"
 
 #define AD_AGP_GUID "edacfd8f-ffb3-11d1-b41d-00a0c968f939"
+#define AD_AUTHENTICATED_USERS_SID "S-1-5-11"
 #define SID_MAX_LEN 1024
 
 bool string_to_sid(struct dom_sid *sidout, const char *sidstr);
 int dom_sid_string_buf(const struct dom_sid *sid, char *buf, int buflen);
 bool dom_sid_equal(const struct dom_sid *sid1, const struct dom_sid *sid2);
+
 
 enum ndr_err_code
 ndr_pull_security_descriptor(struct ndr_pull *ndr,
@@ -63,10 +66,10 @@ ndr_pull_security_descriptor(struct ndr_pull *ndr,
 
 struct gp_som {
     char *som_dn;
-    struct gp_link **gplink_list;
+    struct gp_gplink **gplink_list;
 };
 
-struct gp_link {
+struct gp_gplink {
     char *gpo_dn;
     bool enforced;
 };
@@ -91,6 +94,10 @@ enum ace_eval_status {
 /* 
  * This function retrieves the SIDs corresponding to the input user and returns
  * the user_sid, group_sids, and group_size in their respective output params.
+ *
+ * Note: since pam_authenticate() must complete successfully before the gpo access
+ * checks are called, we can safely assume that the user/computer has been authenticated.
+ * As such, this function always adds the AD_AUTHENTICATED_USERS_SID to the group_sids.
  */
 static errno_t
 ad_gpo_get_sids(TALLOC_CTX *mem_ctx,
@@ -119,15 +126,19 @@ ad_gpo_get_sids(TALLOC_CTX *mem_ctx,
     mysid = ldb_msg_find_attr_as_string(res->msgs[0], 
                                         SYSDB_SID_STR, NULL);
     numgroupsids = (res->count) - 1;
-    
-    groupsids = malloc(numgroupsids * sizeof(char*));
+
+    /* we use (numgroupsids + 1) to leave room for AD_AUTHENTICATED_USERS_SID */
+    groupsids = malloc((numgroupsids + 1) * sizeof(char*));
     for (i = 0; i < numgroupsids; i++) {
         groupsids[i] = malloc(SID_MAX_LEN * sizeof(char));
         groupsids[i] = ldb_msg_find_attr_as_string(res->msgs[i+1], 
                                                    SYSDB_SID_STR, NULL);
     }
+
+    groupsids[i] = malloc(SID_MAX_LEN * sizeof(char));
+    groupsids[i] = AD_AUTHENTICATED_USERS_SID;
     
-    *_group_size = numgroupsids;
+    *_group_size = numgroupsids + 1;
     *_group_sids = groupsids;
     *_user_sid = mysid;
     return EOK;
@@ -315,7 +326,6 @@ static errno_t ad_gpo_evaluate_dacl(TALLOC_CTX *mem_ctx,
     }
 
     for (i = 0; i < dacl->num_aces; i ++) {
-
         ace = &dacl->aces[i];
 
         ace_status = ad_gpo_evaluate_ace(ace, user_sid, group_sids, group_size);
@@ -330,7 +340,6 @@ static errno_t ad_gpo_evaluate_dacl(TALLOC_CTX *mem_ctx,
             *_access_allowed = false;
             return EOK;
         }
-
     }
 
     *_access_allowed = false;
@@ -388,7 +397,7 @@ ad_gpo_filter_gpo_list(TALLOC_CTX *mem_ctx,
         sd = gpo->gpo_sd;
         dacl = gpo->gpo_sd->dacl;
 
-        DEBUG(SSSDBG_TRACE_FUNC, ("gpo_cn:%s\n", gpo->gpo_cn));
+        DEBUG(SSSDBG_TRACE_ALL, ("gpo_dn:%s\n", gpo->gpo_dn));
 
         /* 
          * [MS-ADTS] 5.1.3.3.4:
@@ -396,7 +405,7 @@ ad_gpo_filter_gpo_list(TALLOC_CTX *mem_ctx,
          * is not set, then grant requester the requested control access right.
          */
         if ((!(sd->type & SEC_DESC_DACL_PRESENT)) || (dacl == NULL)) {
-            DEBUG(SSSDBG_TRACE_FUNC, ("DACL is not present\n"));
+            DEBUG(SSSDBG_TRACE_ALL, ("DACL is not present\n"));
             access_allowed = true;
             break;
         }
@@ -404,11 +413,11 @@ ad_gpo_filter_gpo_list(TALLOC_CTX *mem_ctx,
         ad_gpo_evaluate_dacl(mem_ctx, dacl, user_sid, group_sids,
                              group_size, &access_allowed);
         if (access_allowed) {
-            DEBUG(SSSDBG_TRACE_FUNC, ("GPO applicable to target per security filtering\n"));
+            DEBUG(SSSDBG_TRACE_ALL, ("GPO applicable to target per security filtering\n"));
             filtered_gpo_list[gpo_dn_idx] = talloc_steal(mem_ctx, gpo);
             gpo_dn_idx++;
         } else {
-            DEBUG(SSSDBG_TRACE_FUNC, ("GPO not applicable to target per security filtering\n"));
+            DEBUG(SSSDBG_TRACE_ALL, ("GPO not applicable to target per security filtering\n"));
         }
     }
 
@@ -443,7 +452,7 @@ static char *ad_gpo_parent_dn(const char *dn)
 }
 
 /* 
- * This function examines the gp_link objects in each gp_som object specified
+ * This function examines the gp_gplink objects in each gp_som object specified
  * in the input som_list, and populates the _gpo_list output parameter's
  * gpo_dn fields with prioritized list of GPO DNs. Prioritization ensures that:
  * - GPOs linked to an OU will be applied after GPOs linked to a Domain,
@@ -466,7 +475,7 @@ ad_gpo_populate_gpo_list(TALLOC_CTX *mem_ctx,
 
     TALLOC_CTX *tmp_ctx = NULL;
     struct gp_som *gp_som = NULL;
-    struct gp_link *gp_link = NULL;
+    struct gp_gplink *gp_gplink = NULL;
     struct gp_gpo **gpo_list = NULL;
     char **enforced_gpo_dns = NULL;
     char **unenforced_gpo_dns = NULL;
@@ -490,13 +499,13 @@ ad_gpo_populate_gpo_list(TALLOC_CTX *mem_ctx,
         gp_som = som_list[i];
         j = 0;
         while (gp_som->gplink_list[j]) {
-            gp_link = gp_som->gplink_list[j];
-            if (gp_link == NULL) {
-                DEBUG(SSSDBG_OP_FAILURE, ("unexpected null gp_link\n"));
+            gp_gplink = gp_som->gplink_list[j];
+            if (gp_gplink == NULL) {
+                DEBUG(SSSDBG_OP_FAILURE, ("unexpected null gp_gplink\n"));
                 ret = EINVAL;
                 goto done;
             }
-            if (gp_link->enforced){
+            if (gp_gplink->enforced){
                 num_enforced++;
             } else {
                 num_unenforced++;
@@ -531,15 +540,15 @@ ad_gpo_populate_gpo_list(TALLOC_CTX *mem_ctx,
         gp_som = som_list[i];
         j = 0;
         while (gp_som->gplink_list[j]) {
-            gp_link = gp_som->gplink_list[j];
-            if (gp_link == NULL) {
-                DEBUG(SSSDBG_OP_FAILURE, ("unexpected null gp_link\n"));
+            gp_gplink = gp_som->gplink_list[j];
+            if (gp_gplink == NULL) {
+                DEBUG(SSSDBG_OP_FAILURE, ("unexpected null gp_gplink\n"));
                 ret = EINVAL;
                 goto done;
             }
-            if (gp_link->enforced){
+            if (gp_gplink->enforced){
                 enforced_gpo_dns[enforced_idx] = talloc_strdup(enforced_gpo_dns, 
-                                                     gp_link->gpo_dn);
+                                                     gp_gplink->gpo_dn);
                 if (enforced_gpo_dns[enforced_idx] == NULL) {
                     ret = ENOMEM;
                     goto done;
@@ -547,7 +556,7 @@ ad_gpo_populate_gpo_list(TALLOC_CTX *mem_ctx,
                 enforced_idx++;
             } else {
                 unenforced_gpo_dns[unenforced_idx] = talloc_strdup(unenforced_gpo_dns,
-                                                         gp_link->gpo_dn);
+                                                         gp_gplink->gpo_dn);
                 if (unenforced_gpo_dns[unenforced_idx] == NULL) {
                     ret = ENOMEM;
                     goto done;
@@ -580,7 +589,7 @@ ad_gpo_populate_gpo_list(TALLOC_CTX *mem_ctx,
             ret = ENOMEM;
             goto done;
         }
-        DEBUG(SSSDBG_TRACE_FUNC, ("gpo_dn[%d]: %s\n", gpo_dn_idx,
+        DEBUG(SSSDBG_TRACE_FUNC, ("gpo_list[%d]->gpo_dn: %s\n", gpo_dn_idx,
                                   gpo_list[gpo_dn_idx]->gpo_dn));
         gpo_dn_idx++;
     }
@@ -599,7 +608,7 @@ ad_gpo_populate_gpo_list(TALLOC_CTX *mem_ctx,
             goto done;
         }
 
-        DEBUG(SSSDBG_TRACE_FUNC, ("gpo_dn[%d]: %s\n", gpo_dn_idx, 
+        DEBUG(SSSDBG_TRACE_FUNC, ("gpo_list[%d]->gpo_dn: %s\n", gpo_dn_idx, 
                                   gpo_list[gpo_dn_idx]->gpo_dn));
         gpo_dn_idx++;
     }
@@ -617,7 +626,7 @@ ad_gpo_populate_gpo_list(TALLOC_CTX *mem_ctx,
 
 /* 
  * This function populates the _gplink_list output parameter by parsing the
- * input raw_gplink_value into an array of gp_link objects, each consisting of
+ * input raw_gplink_value into an array of gp_gplink objects, each consisting of
  * a GPO DN and bool enforced field. 
  *
  * The raw_gplink_value is single string consisting of multiple gplink strings.
@@ -638,8 +647,9 @@ ad_gpo_populate_gpo_list(TALLOC_CTX *mem_ctx,
  */
 static errno_t
 ad_gpo_populate_gplink_list(TALLOC_CTX *mem_ctx,
+                            char *som_dn,
                             char *raw_gplink_value,
-                            struct gp_link ***_gplink_list,
+                            struct gp_gplink ***_gplink_list,
                             bool allow_enforced_only) 
 {
     TALLOC_CTX *tmp_ctx = NULL;
@@ -649,15 +659,14 @@ ad_gpo_populate_gplink_list(TALLOC_CTX *mem_ctx,
     char *dn;
     char *gplink_options;
     char delim = ']';
-    struct gp_link **gplink_list;
+    struct gp_gplink **gplink_list;
     int i;
     int ret;
     int gplink_number;
     int gplink_count = 0;
-    int num_enforced = 0;
-    int num_unenforced = 0;
     int num_enabled = 0;
 
+    DEBUG(SSSDBG_TRACE_ALL, ("som_dn: %s\n", som_dn));
     tmp_ctx = talloc_new(NULL);
     if (tmp_ctx == NULL) {
         ret = ENOMEM;
@@ -681,7 +690,7 @@ ad_gpo_populate_gplink_list(TALLOC_CTX *mem_ctx,
         goto done;
     }
 
-    gplink_list = talloc_array(tmp_ctx, struct gp_link *, gplink_count + 1);
+    gplink_list = talloc_array(tmp_ctx, struct gp_gplink *, gplink_count + 1);
     if (gplink_list == NULL) {
         ret = ENOMEM;
         goto done;
@@ -697,12 +706,10 @@ ad_gpo_populate_gplink_list(TALLOC_CTX *mem_ctx,
         }
         *last = '\0';
         last++;
-
         dn = first;
         if ( strncasecmp(dn, "LDAP://", 7)== 0 ) {
             dn = dn + 7;
         }
-
         gplink_options = strchr(first, ';');
         if (gplink_options == NULL) {
             break;
@@ -712,22 +719,30 @@ ad_gpo_populate_gplink_list(TALLOC_CTX *mem_ctx,
 
         gplink_number = atoi(gplink_options);
 
+        DEBUG(SSSDBG_TRACE_ALL, ("processing gplink_list[%d]: [%s; %d]\n", num_enabled,
+                                  dn, gplink_number));
+
         if ((gplink_number == 1) || (gplink_number ==3)){
             /* ignore flag is set */
+            DEBUG(SSSDBG_TRACE_ALL, ("ignored gpo skipped\n"));
+            copy = last;
             continue;
         }
 
         if (allow_enforced_only && (gplink_number == 0)) {
             /* unenforced flag is set; only enforced gpos allowed */
+            DEBUG(SSSDBG_TRACE_ALL, ("unenforced gpo skipped\n"));
+            copy = last;
             continue;
         }
 
-        gplink_list[num_enabled] = talloc_zero(gplink_list, struct gp_link);
+        gplink_list[num_enabled] = talloc_zero(gplink_list, struct gp_gplink);
         if (gplink_list[num_enabled] == NULL) {
             ret = ENOMEM;
             goto done;
         }
         gplink_list[num_enabled]->gpo_dn = talloc_strdup(gplink_list[num_enabled], dn);
+
         if (gplink_list[num_enabled]->gpo_dn == NULL) {
             ret = ENOMEM;
             goto done;
@@ -735,11 +750,9 @@ ad_gpo_populate_gplink_list(TALLOC_CTX *mem_ctx,
 
         if (gplink_number == 0){
             gplink_list[num_enabled]->enforced = 0;
-            num_unenforced++;
             num_enabled++;
         } else if (gplink_number == 2) {
             gplink_list[num_enabled]->enforced = 1;
-            num_enforced++;
             num_enabled++;
         } else {
             ret = EINVAL;
@@ -766,10 +779,12 @@ ad_gpo_populate_gplink_list(TALLOC_CTX *mem_ctx,
  * Example: if input DN is "CN=MyComputer,CN=Computers,OU=Sales,DC=FOO,DC=COM",
  * then SOM List has 2 SOM entries: {[OU=Sales,DC=FOO,DC=COM], [DC=FOO, DC=COM]} 
  */
+
 static errno_t
-ad_gpo_parse_dn(TALLOC_CTX *mem_ctx,
-                char *target_dn,
-                struct gp_som ***_som_list) 
+ad_gpo_populate_som_list(TALLOC_CTX *mem_ctx, 
+                         char *target_dn,
+                         int *_num_soms,
+                         struct gp_som ***_som_list) 
 {
     TALLOC_CTX *tmp_ctx = NULL;
     int ret;
@@ -834,6 +849,7 @@ ad_gpo_parse_dn(TALLOC_CTX *mem_ctx,
                 ret = ENOMEM;
                 goto done;
             }
+
             som_idx++;
             break;
         }
@@ -841,9 +857,9 @@ ad_gpo_parse_dn(TALLOC_CTX *mem_ctx,
         tmp_dn = parent_dn;
     }
 
-    /* TBD: now, populate the Site SOM */
-      
     som_list[som_idx] = NULL;
+
+    *_num_soms = som_idx;
 
     *_som_list = talloc_steal(mem_ctx, som_list);
 
@@ -856,10 +872,12 @@ ad_gpo_parse_dn(TALLOC_CTX *mem_ctx,
 
 struct ad_gpo_access_state {
     struct tevent_context *ev;
+    struct sdap_id_conn_ctx *conn;
     struct sdap_id_op *sdap_op; 
     struct sdap_options *opts;
     int timeout;
     struct sss_domain_info *domain;
+    char *domain_dn;
     char *user;
     char *ad_hostname;
     char *target_dn;
@@ -867,7 +885,7 @@ struct ad_gpo_access_state {
 };
 
 static void ad_gpo_connect_done(struct tevent_req *subreq);
-static void ad_gpo_dn_retrieval_done(struct tevent_req *subreq);
+static void ad_gpo_target_dn_retrieval_done(struct tevent_req *subreq);
 static void ad_gpo_process_som_done(struct tevent_req *subreq);
 static void ad_gpo_process_gpo_done(struct tevent_req *subreq);
 
@@ -882,10 +900,13 @@ int ad_gpo_process_gpo_recv(struct tevent_req *req,
                             TALLOC_CTX *mem_ctx,
                             struct gp_gpo ***gpo_list);
 struct tevent_req *ad_gpo_process_som_send(TALLOC_CTX *mem_ctx,
-                                           struct tevent_context *ev,
+                                           struct tevent_context *ev, 
+                                           struct sdap_id_conn_ctx *conn,
                                            struct sdap_id_op *sdap_op,
                                            struct sdap_options *opts,
                                            int timeout,
+                                           char *domain_name,
+                                           char *domain_dn,
                                            char *target_dn);
 int ad_gpo_process_som_recv(struct tevent_req *req,
                             TALLOC_CTX *mem_ctx,
@@ -901,7 +922,6 @@ ad_gpo_access_send(TALLOC_CTX *mem_ctx,
     struct tevent_req *req;
     struct tevent_req *subreq;
     struct ad_gpo_access_state *state;
-    struct sdap_id_conn_ctx *conn;
     errno_t ret;
 
     req = tevent_req_create(mem_ctx, &state, struct ad_gpo_access_state);
@@ -917,9 +937,8 @@ ad_gpo_access_send(TALLOC_CTX *mem_ctx,
     state->ad_hostname = dp_opt_get_string(ctx->ad_options, AD_HOSTNAME);
     state->opts = ctx->sdap_access_ctx->id_ctx->opts;
     state->timeout = dp_opt_get_int(state->opts->basic, SDAP_SEARCH_TIMEOUT);
-    conn = ad_get_dom_ldap_conn(ctx->ad_id_ctx, domain);
-    state->sdap_op = sdap_id_op_create(state, conn->conn_cache);
-
+    state->conn = ad_get_dom_ldap_conn(ctx->ad_id_ctx, domain);
+    state->sdap_op = sdap_id_op_create(state, state->conn->conn_cache);
     if (state->sdap_op == NULL) {
         DEBUG(SSSDBG_OP_FAILURE, ("sdap_id_op_create failed.\n"));
         ret = ENOMEM;
@@ -931,8 +950,6 @@ ad_gpo_access_send(TALLOC_CTX *mem_ctx,
         ret = ENOMEM;
         goto immediately;
     }
-
-
 
     tevent_req_set_callback(subreq, ad_gpo_connect_done, req);
 
@@ -959,7 +976,6 @@ ad_gpo_connect_done(struct tevent_req *subreq)
     struct ad_gpo_access_state *state;
     char* filter;
     char *sam_account_name;
-    char *domain_dn;
     int dp_error;
     errno_t ret;
 
@@ -991,7 +1007,7 @@ ad_gpo_connect_done(struct tevent_req *subreq)
     DEBUG(SSSDBG_TRACE_FUNC, ("sam_account_name is %s\n", sam_account_name));
 
     /* Convert the domain name into domain DN */
-    ret = domain_to_basedn(state, state->domain->name, &domain_dn);
+    ret = domain_to_basedn(state, state->domain->name, &state->domain_dn);
     if (ret != EOK) {
         DEBUG(SSSDBG_OP_FAILURE,
               ("Cannot convert domain name [%s] to base DN [%d]: %s\n",
@@ -1014,7 +1030,7 @@ ad_gpo_connect_done(struct tevent_req *subreq)
 
     subreq = sdap_get_generic_send(state, state->ev, state->opts,
                                    sdap_id_op_handle(state->sdap_op),
-                                   domain_dn, LDAP_SCOPE_SUBTREE,
+                                   state->domain_dn, LDAP_SCOPE_SUBTREE,
                                    filter, attrs, NULL, 0,
                                    state->timeout,
                                    false);
@@ -1025,11 +1041,11 @@ ad_gpo_connect_done(struct tevent_req *subreq)
         return;
     }
 
-    tevent_req_set_callback(subreq, ad_gpo_dn_retrieval_done, req);
+    tevent_req_set_callback(subreq, ad_gpo_target_dn_retrieval_done, req);
 }
 
 static void
-ad_gpo_dn_retrieval_done(struct tevent_req *subreq)
+ad_gpo_target_dn_retrieval_done(struct tevent_req *subreq)
 {
     struct tevent_req *req;
     struct ad_gpo_access_state *state;
@@ -1088,9 +1104,12 @@ ad_gpo_dn_retrieval_done(struct tevent_req *subreq)
 
     subreq = ad_gpo_process_som_send(state,
                                      state->ev,
+                                     state->conn,
                                      state->sdap_op,
                                      state->opts,
                                      state->timeout,
+                                     state->domain->name,
+                                     state->domain_dn,
                                      state->target_dn);
     if (subreq == NULL) {
         ret = ENOMEM;
@@ -1186,8 +1205,8 @@ ad_gpo_process_gpo_done(struct tevent_req *subreq)
 
     i = 0;
     while (state->filtered_gpo_list[i]) {
-        DEBUG(SSSDBG_TRACE_FUNC, ("filtered_gpo_list[%d] is %s\n", i, 
-                                  state->filtered_gpo_list[i]->gpo_cn));
+        DEBUG(SSSDBG_TRACE_FUNC, ("filtered_gpo_list[%d]->gpo_dn is %s\n", i, 
+                                  state->filtered_gpo_list[i]->gpo_dn));
         i++;
     }
 
@@ -1196,7 +1215,7 @@ ad_gpo_process_gpo_done(struct tevent_req *subreq)
     }
 
     /* TBD: initiate SMB retrieval */
-    DEBUG(SSSDBG_TRACE_FUNC, ("implement SMB retrieval\n"));
+    DEBUG(SSSDBG_TRACE_FUNC, ("time for SMB retrieval\n"));
 
  done:
 
@@ -1221,22 +1240,30 @@ struct ad_gpo_process_som_state {
     struct sdap_options *opts;
     int timeout;
     bool allow_enforced_only;
+    char *site_dn;
+    char *domain_dn;
     struct gp_som **som_list;
     int som_index;
+    int num_soms;
 };
 
+static void ad_gpo_site_name_retrieval_done(struct tevent_req *subreq);
 static errno_t ad_gpo_get_som_attrs_step(struct tevent_req *req);
 static void ad_gpo_get_som_attrs_done(struct tevent_req *subreq);
 
 struct tevent_req *
 ad_gpo_process_som_send(TALLOC_CTX *mem_ctx,
                         struct tevent_context *ev, 
+                        struct sdap_id_conn_ctx *conn,
                         struct sdap_id_op *sdap_op,
                         struct sdap_options *opts,
                         int timeout,
+                        char *domain_name,
+                        char *domain_dn,
                         char *target_dn)
 {
     struct tevent_req *req;
+    struct tevent_req *subreq;
     struct ad_gpo_process_som_state *state;
     errno_t ret;
 
@@ -1250,10 +1277,11 @@ ad_gpo_process_som_send(TALLOC_CTX *mem_ctx,
     state->sdap_op = sdap_op;
     state->opts = opts;
     state->timeout = timeout;
+    state->domain_dn = domain_dn;
     state->som_index = -1;
     state->allow_enforced_only = 0;
 
-    ret = ad_gpo_parse_dn(state, target_dn, &state->som_list);
+    ret = ad_gpo_populate_som_list(state, target_dn, &state->num_soms, &state->som_list);
 
     if (ret != EOK) {
         DEBUG(SSSDBG_OP_FAILURE,
@@ -1263,15 +1291,24 @@ ad_gpo_process_som_send(TALLOC_CTX *mem_ctx,
         goto immediately;
     }
 
-    /* TBD: retrieve site SOM */
-
     if (state->som_list == NULL) {
         DEBUG(SSSDBG_OP_FAILURE, ("target dn must have at least one parent\n"));
         ret = EINVAL;
         goto immediately;
     }
 
-    ret = ad_gpo_get_som_attrs_step(req);
+    subreq = ad_master_domain_send(state, state->ev, conn, 
+                                   state->sdap_op, domain_name);
+
+    if (subreq == NULL) {
+        DEBUG(SSSDBG_OP_FAILURE, ("ad_master_domain_send failed.\n"));
+        ret = ENOMEM;
+        goto immediately;
+    }
+
+    tevent_req_set_callback(subreq, ad_gpo_site_name_retrieval_done, req);
+
+    return req;
 
  immediately:
 
@@ -1284,6 +1321,67 @@ ad_gpo_process_som_send(TALLOC_CTX *mem_ctx,
     }
 
     return req;
+}
+
+static void
+ad_gpo_site_name_retrieval_done(struct tevent_req *subreq)
+{
+    struct tevent_req *req;
+    struct ad_gpo_process_som_state *state;
+    int ret;
+    int i = 0;
+    char *flat_name;
+    char *site;
+    char *master_sid;
+    char *forest;
+
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req, struct ad_gpo_process_som_state);
+
+    /* gpo code only cares about the site name */
+    ret = ad_master_domain_recv(subreq, state,
+                                &flat_name, &master_sid, &site, &forest);
+    talloc_zfree(subreq);
+
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE, ("Cannot retrieve master domain info\n"));
+        ret = ENOENT;
+        goto done;
+    }
+
+    state->site_dn = talloc_asprintf(state, "cn=%s,cn=Sites,cn=Configuration,%s", site, state->domain_dn);
+
+    /* note that we already included space for the site_dn when allocating som_list */
+    state->som_list[state->num_soms] = talloc_zero(state->som_list, struct gp_som);
+    if (state->som_list[state->num_soms] == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+    state->som_list[state->num_soms]->som_dn = talloc_strdup(state->som_list[state->num_soms],
+                                                             state->site_dn);
+    if (state->som_list[state->num_soms]->som_dn == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    state->num_soms++;
+    state->som_list[state->num_soms] = NULL;
+
+    while (state->som_list[i]) {
+        DEBUG(SSSDBG_TRACE_FUNC, ("som_list[%d]->som_dn is %s\n", i, 
+                                  state->som_list[i]->som_dn));
+        i++;
+    }
+
+    ret = ad_gpo_get_som_attrs_step(req);
+
+ done:
+
+    if (ret == EOK) {
+        tevent_req_done(req);
+    } else if (ret != EAGAIN) {
+        tevent_req_error(req, ret);
+    }
 }
 
 static errno_t
@@ -1385,7 +1483,7 @@ ad_gpo_get_som_attrs_done(struct tevent_req *subreq)
     }
 
     if ((ret == ENOENT) || (el->num_values == 0)) {
-        DEBUG(SSSDBG_OP_FAILURE,
+        DEBUG(SSSDBG_TRACE_ALL,
               ("gpoptions attr not found or has no value; defaults to 0\n"));
         allow_enforced_only = 0;
     }  else {
@@ -1395,6 +1493,7 @@ ad_gpo_get_som_attrs_done(struct tevent_req *subreq)
 
     gp_som = state->som_list[state->som_index];
     ret = ad_gpo_populate_gplink_list(gp_som,
+                                      gp_som->som_dn,
                                       (char *)raw_gplink_value,
                                       &gp_som->gplink_list,
                                       state->allow_enforced_only);
