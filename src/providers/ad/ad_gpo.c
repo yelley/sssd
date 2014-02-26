@@ -36,6 +36,8 @@
 #include "providers/ldap/sdap.h"
 
 #define AD_AT_DN "distinguishedName"
+#define AD_AT_UAC "userAccountControl"
+#define AD_AT_CONFIG_NC "configurationNamingContext"
 #define AD_AT_GPLINK "gPLink"
 #define AD_AT_GPOPTIONS "gpOptions"
 #define AD_AT_NT_SEC_DESC "nTSecurityDescriptor"
@@ -47,17 +49,18 @@
 #define AD_AT_USER_EXT_NAMES "gPCUserExtensionNames"
 #define AD_AT_FUNC_VERSION "gPCFunctionalityVersion"
 #define AD_AT_FLAGS "flags"
-#define AD_AT_WQL_FILTER "gPCWQLFilter"
-#define AD_AT_OBJECT_CLASS "objectClass"
 
+#define UAC_WORKSTATION_TRUST_ACCOUNT 0x00001000
 #define AD_AGP_GUID "edacfd8f-ffb3-11d1-b41d-00a0c968f939"
 #define AD_AUTHENTICATED_USERS_SID "S-1-5-11"
 #define SID_MAX_LEN 1024
 
+#define GPO_VERSION_USER(x) (x >> 16)
+#define GPO_VERSION_MACHINE(x) (x & 0xffff)
+
 bool string_to_sid(struct dom_sid *sidout, const char *sidstr);
 int dom_sid_string_buf(const struct dom_sid *sid, char *buf, int buflen);
 bool dom_sid_equal(const struct dom_sid *sid1, const struct dom_sid *sid2);
-
 
 enum ndr_err_code
 ndr_pull_security_descriptor(struct ndr_pull *ndr,
@@ -80,9 +83,10 @@ struct gp_gpo {
     char *gpo_cn;
     char *gpo_display_name;
     char *gpo_file_sys_path;
-    char *gpo_version_number;
+    uint32_t gpo_container_version_number;
     char *gpo_machine_ext_names;
-    char *gpo_func_version;
+    int gpo_func_version;
+    int gpo_flags;
 };
 
 enum ace_eval_status {
@@ -95,9 +99,10 @@ enum ace_eval_status {
  * This function retrieves the SIDs corresponding to the input user and returns
  * the user_sid, group_sids, and group_size in their respective output params.
  *
- * Note: since pam_authenticate() must complete successfully before the gpo access
- * checks are called, we can safely assume that the user/computer has been authenticated.
- * As such, this function always adds the AD_AUTHENTICATED_USERS_SID to the group_sids.
+ * Note: since pam_authenticate() must complete successfully before the
+ * gpo access checks are called, we can safely assume that the user/computer has
+ * been authenticated. As such, this function always adds the
+ * AD_AUTHENTICATED_USERS_SID to the group_sids.
  */
 static errno_t
 ad_gpo_get_sids(TALLOC_CTX *mem_ctx,
@@ -348,8 +353,9 @@ static errno_t ad_gpo_evaluate_dacl(TALLOC_CTX *mem_ctx,
 
 /* 
  * This function takes an input gpo_list, filters out any gpo that is
- * not applicable to the policy target (based on the gpo's security descriptor,
- * and assigns the result to the _filtered_gpo_list output parameter.
+ * not applicable to the policy target and assigns the result to the
+ * _filtered_gpo_list output parameter. The filtering algorithm is
+ * defined in [MS-GPOL] 3.2.5.1.6
  */
 static errno_t
 ad_gpo_filter_gpo_list(TALLOC_CTX *mem_ctx, 
@@ -371,7 +377,8 @@ ad_gpo_filter_gpo_list(TALLOC_CTX *mem_ctx,
     bool access_allowed = false;
     struct gp_gpo **filtered_gpo_list = NULL;
 
-    ret = ad_gpo_get_sids(mem_ctx, user, domain, &user_sid, &group_sids, &group_size);
+    ret = ad_gpo_get_sids(mem_ctx, user, domain, &user_sid,
+                          &group_sids, &group_size);
     if (ret != EOK) {
         DEBUG(SSSDBG_OP_FAILURE,
               ("Unable to retrieve SIDs: [%d](%s)\n",
@@ -399,11 +406,26 @@ ad_gpo_filter_gpo_list(TALLOC_CTX *mem_ctx,
 
         DEBUG(SSSDBG_TRACE_ALL, ("gpo_dn:%s\n", gpo->gpo_dn));
 
+        /* gpo_func_version must be set to version 2 */
+        if (gpo->gpo_func_version != 2) {
+            DEBUG(SSSDBG_TRACE_ALL,
+                  ("GPO not applicable to target per security filtering\n"));
+            continue;
+        }
+
+        /* gpo_flags value of 2 means that GPO's computer portion is disabled */
+        if (gpo->gpo_flags == 2) {
+            DEBUG(SSSDBG_TRACE_ALL,
+                  ("GPO not applicable to target per security filtering\n"));
+            continue;
+        }
+
         /* 
          * [MS-ADTS] 5.1.3.3.4:
          * If the security descriptor has no DACL or its "DACL Present" bit
          * is not set, then grant requester the requested control access right.
          */
+
         if ((!(sd->type & SEC_DESC_DACL_PRESENT)) || (dacl == NULL)) {
             DEBUG(SSSDBG_TRACE_ALL, ("DACL is not present\n"));
             access_allowed = true;
@@ -413,11 +435,13 @@ ad_gpo_filter_gpo_list(TALLOC_CTX *mem_ctx,
         ad_gpo_evaluate_dacl(mem_ctx, dacl, user_sid, group_sids,
                              group_size, &access_allowed);
         if (access_allowed) {
-            DEBUG(SSSDBG_TRACE_ALL, ("GPO applicable to target per security filtering\n"));
+            DEBUG(SSSDBG_TRACE_ALL, 
+                  ("GPO applicable to target per security filtering\n"));
             filtered_gpo_list[gpo_dn_idx] = talloc_steal(mem_ctx, gpo);
             gpo_dn_idx++;
         } else {
-            DEBUG(SSSDBG_TRACE_ALL, ("GPO not applicable to target per security filtering\n"));
+            DEBUG(SSSDBG_TRACE_ALL, 
+                  ("GPO not applicable to target per security filtering\n"));
         }
     }
 
@@ -555,8 +579,8 @@ ad_gpo_populate_gpo_list(TALLOC_CTX *mem_ctx,
                 }
                 enforced_idx++;
             } else {
-                unenforced_gpo_dns[unenforced_idx] = talloc_strdup(unenforced_gpo_dns,
-                                                         gp_gplink->gpo_dn);
+                unenforced_gpo_dns[unenforced_idx] =
+                    talloc_strdup(unenforced_gpo_dns, gp_gplink->gpo_dn);
                 if (unenforced_gpo_dns[unenforced_idx] == NULL) {
                     ret = ENOMEM;
                     goto done;
@@ -718,9 +742,8 @@ ad_gpo_populate_gplink_list(TALLOC_CTX *mem_ctx,
         gplink_options++;
 
         gplink_number = atoi(gplink_options);
-
-        DEBUG(SSSDBG_TRACE_ALL, ("processing gplink_list[%d]: [%s; %d]\n", num_enabled,
-                                  dn, gplink_number));
+        DEBUG(SSSDBG_TRACE_ALL, 
+              ("gplink_list[%d]: [%s; %d]\n", num_enabled, dn, gplink_number));
 
         if ((gplink_number == 1) || (gplink_number ==3)){
             /* ignore flag is set */
@@ -741,7 +764,8 @@ ad_gpo_populate_gplink_list(TALLOC_CTX *mem_ctx,
             ret = ENOMEM;
             goto done;
         }
-        gplink_list[num_enabled]->gpo_dn = talloc_strdup(gplink_list[num_enabled], dn);
+        gplink_list[num_enabled]->gpo_dn =
+            talloc_strdup(gplink_list[num_enabled], dn);
 
         if (gplink_list[num_enabled]->gpo_dn == NULL) {
             ret = ENOMEM;
@@ -979,7 +1003,7 @@ ad_gpo_connect_done(struct tevent_req *subreq)
     int dp_error;
     errno_t ret;
 
-    const char *attrs[] = {AD_AT_DN, NULL};
+    const char *attrs[] = {AD_AT_DN, AD_AT_UAC, NULL};
 
     req = tevent_req_callback_data(subreq, struct tevent_req);
     state = tevent_req_data(req, struct ad_gpo_access_state);
@@ -1093,6 +1117,27 @@ ad_gpo_target_dn_retrieval_done(struct tevent_req *subreq)
         DEBUG(SSSDBG_OP_FAILURE,
               ("sysdb_attrs_get_string failed: [%d](%s)\n",
                ret, strerror(ret)));
+        goto done;
+    }
+
+    state->target_dn = talloc_strdup(state, target_dn);
+    if (state->target_dn == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    uint32_t uac;
+    ret = sysdb_attrs_get_uint32_t(reply[0], AD_AT_UAC, &uac);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              ("sysdb_attrs_get_uint32_t failed: [%d](%s)\n",
+               ret, strerror(ret)));
+        goto done;
+    }
+
+    /* we only support computer policy targets, not users */
+    if (!(uac & UAC_WORKSTATION_TRUST_ACCOUNT)) {
+        ret = EINVAL;
         goto done;
     }
 
@@ -1240,6 +1285,7 @@ struct ad_gpo_process_som_state {
     struct sdap_options *opts;
     int timeout;
     bool allow_enforced_only;
+    char *site_name;
     char *site_dn;
     char *domain_dn;
     struct gp_som **som_list;
@@ -1248,6 +1294,7 @@ struct ad_gpo_process_som_state {
 };
 
 static void ad_gpo_site_name_retrieval_done(struct tevent_req *subreq);
+static void ad_gpo_site_dn_retrieval_done(struct tevent_req *subreq);
 static errno_t ad_gpo_get_som_attrs_step(struct tevent_req *req);
 static void ad_gpo_get_som_attrs_done(struct tevent_req *subreq);
 
@@ -1281,8 +1328,8 @@ ad_gpo_process_som_send(TALLOC_CTX *mem_ctx,
     state->som_index = -1;
     state->allow_enforced_only = 0;
 
-    ret = ad_gpo_populate_som_list(state, target_dn, &state->num_soms, &state->som_list);
-
+    ret = ad_gpo_populate_som_list(state, target_dn,
+                                   &state->num_soms, &state->som_list);
     if (ret != EOK) {
         DEBUG(SSSDBG_OP_FAILURE,
               ("Unable to retrieve SOM List : [%d](%s)\n",
@@ -1329,11 +1376,11 @@ ad_gpo_site_name_retrieval_done(struct tevent_req *subreq)
     struct tevent_req *req;
     struct ad_gpo_process_som_state *state;
     int ret;
-    int i = 0;
     char *flat_name;
     char *site;
     char *master_sid;
     char *forest;
+    const char *attrs[] = {AD_AT_CONFIG_NC, NULL};
 
     req = tevent_req_callback_data(subreq, struct tevent_req);
     state = tevent_req_data(req, struct ad_gpo_process_som_state);
@@ -1345,20 +1392,103 @@ ad_gpo_site_name_retrieval_done(struct tevent_req *subreq)
 
     if (ret != EOK) {
         DEBUG(SSSDBG_OP_FAILURE, ("Cannot retrieve master domain info\n"));
+        tevent_req_error(req, ENOENT);
+        return;
+    }
+
+    state->site_name = talloc_asprintf(state, "cn=%s", site);
+    if (state->site_name == NULL) {
+        tevent_req_error(req, ENOMEM);
+        return;
+    }
+
+    subreq = sdap_get_generic_send(state, state->ev, state->opts,
+                                   sdap_id_op_handle(state->sdap_op),
+                                   "", LDAP_SCOPE_BASE,
+                                   "(objectclass=*)", attrs, NULL, 0,
+                                   state->timeout,
+                                   false);
+
+    if (subreq == NULL) {
+        DEBUG(SSSDBG_OP_FAILURE, ("sdap_get_generic_send failed.\n"));
+        tevent_req_error(req, ENOMEM);
+        return;
+    }
+
+    tevent_req_set_callback(subreq, ad_gpo_site_dn_retrieval_done, req);
+}
+
+static void
+ad_gpo_site_dn_retrieval_done(struct tevent_req *subreq)
+{
+    struct tevent_req *req;
+    struct ad_gpo_process_som_state *state;
+    int ret;
+    int dp_error;
+    int i = 0;
+    size_t reply_count;
+    struct sysdb_attrs **reply;
+    const char *configNC;
+
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req, struct ad_gpo_process_som_state);
+
+    ret = sdap_get_generic_recv(subreq, state,
+                                &reply_count, &reply);
+    talloc_zfree(subreq);
+    if (ret != EOK) {
+        ret = sdap_id_op_done(state->sdap_op, ret, &dp_error);
+        /* TBD: handle (dp_error == DP_ERR_OFFLINE) case */
+
+        DEBUG(SSSDBG_OP_FAILURE,
+              ("Unable to get configNC: [%d](%s)\n",
+               ret, strerror(ret)));
         ret = ENOENT;
         goto done;
     }
 
-    state->site_dn = talloc_asprintf(state, "cn=%s,cn=Sites,cn=Configuration,%s", site, state->domain_dn);
+    /* make sure there is only one non-NULL reply returned */
 
-    /* note that we already included space for the site_dn when allocating som_list */
-    state->som_list[state->num_soms] = talloc_zero(state->som_list, struct gp_som);
+    if (reply_count < 1) {
+        DEBUG(SSSDBG_OP_FAILURE, ("No configNC retrieved\n"));
+        ret = ENOENT;
+        goto done;
+    } else if (reply_count > 1) {
+        DEBUG(SSSDBG_OP_FAILURE, ("Multiple replies for configNC\n"));
+        ret = ERR_INTERNAL;
+        goto done;      
+    } else if (reply == NULL) {
+        DEBUG(SSSDBG_OP_FAILURE, ("reply_count is 1, but reply is NULL\n"));
+        ret = ERR_INTERNAL;
+        goto done;
+    } 
+    
+    /* reply[0] holds requested attributes of single reply */    
+    ret = sysdb_attrs_get_string(reply[0], AD_AT_CONFIG_NC, &configNC);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              ("sysdb_attrs_get_string failed: [%d](%s)\n",
+               ret, strerror(ret)));
+        goto done;
+    }
+    state->site_dn =
+        talloc_asprintf(state, "%s,cn=Sites,%s", state->site_name, configNC);
+    if (state->site_dn == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    /* note that space was allocated for site_dn when allocating som_list */
+    state->som_list[state->num_soms] =
+        talloc_zero(state->som_list, struct gp_som);
     if (state->som_list[state->num_soms] == NULL) {
         ret = ENOMEM;
         goto done;
     }
-    state->som_list[state->num_soms]->som_dn = talloc_strdup(state->som_list[state->num_soms],
-                                                             state->site_dn);
+
+    state->som_list[state->num_soms]->som_dn =
+        talloc_strdup(state->som_list[state->num_soms], state->site_dn);
+
     if (state->som_list[state->num_soms]->som_dn == NULL) {
         ret = ENOMEM;
         goto done;
@@ -1367,6 +1497,7 @@ ad_gpo_site_name_retrieval_done(struct tevent_req *subreq)
     state->num_soms++;
     state->som_list[state->num_soms] = NULL;
 
+    i = 0;
     while (state->som_list[i]) {
         DEBUG(SSSDBG_TRACE_FUNC, ("som_list[%d]->som_dn is %s\n", i, 
                                   state->som_list[i]->som_dn));
@@ -1382,8 +1513,8 @@ ad_gpo_site_name_retrieval_done(struct tevent_req *subreq)
     } else if (ret != EAGAIN) {
         tevent_req_error(req, ret);
     }
-}
 
+}
 static errno_t
 ad_gpo_get_som_attrs_step(struct tevent_req *req)
 {
@@ -1599,7 +1730,8 @@ ad_gpo_get_gpo_attrs_step(struct tevent_req *req)
 {
     const char *attrs[] = {AD_AT_NT_SEC_DESC, AD_AT_CN, AD_AT_DISPLAY_NAME,
                            AD_AT_FILE_SYS_PATH, AD_AT_VERSION_NUMBER,
-                           AD_AT_MACHINE_EXT_NAMES, AD_AT_FUNC_VERSION, NULL};
+                           AD_AT_MACHINE_EXT_NAMES, AD_AT_FUNC_VERSION,
+                           AD_AT_FLAGS, NULL};
     struct tevent_req *subreq;
     struct ad_gpo_process_gpo_state *state;
 
@@ -1612,7 +1744,6 @@ ad_gpo_get_gpo_attrs_step(struct tevent_req *req)
     if (gp_gpo == NULL) return EOK;
 
     char *gpo_dn = gp_gpo->gpo_dn;
-
 
     subreq = sdap_sd_search_send(state, state->ev, 
                                  state->opts, sdap_id_op_handle(state->sdap_op),
@@ -1637,6 +1768,7 @@ ad_gpo_get_gpo_attrs_done(struct tevent_req *subreq)
     size_t num_results;
     struct sysdb_attrs **results;
     struct ldb_message_element *el = NULL;
+    const char *gpo_cn = NULL;
 
     req = tevent_req_callback_data(subreq, struct tevent_req);
     state = tevent_req_data(req, struct ad_gpo_process_gpo_state);
@@ -1669,7 +1801,6 @@ ad_gpo_get_gpo_attrs_done(struct tevent_req *subreq)
     struct gp_gpo *gp_gpo = state->gpo_list[state->gpo_index];
 
     /* retrieve AD_AT_CN */
-    const char *gpo_cn = NULL;
     ret = sysdb_attrs_get_string(results[0], AD_AT_CN, &gpo_cn);
     if (ret != EOK) {
         DEBUG(SSSDBG_OP_FAILURE,
@@ -1719,17 +1850,16 @@ ad_gpo_get_gpo_attrs_done(struct tevent_req *subreq)
         goto done;
     }
 
+
     /* retrieve AD_AT_VERSION_NUMBER */
-    ret = sysdb_attrs_get_el(results[0], AD_AT_VERSION_NUMBER, &el);
-    if (ret != EOK && ret != ENOENT) {
-        DEBUG(SSSDBG_OP_FAILURE, ("sysdb_attrs_get_el() failed\n"));
+    ret = sysdb_attrs_get_uint32_t(results[0], AD_AT_VERSION_NUMBER,
+                                   &gp_gpo->gpo_container_version_number);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              ("sysdb_attrs_get_uint32_t failed: [%d](%s)\n",
+               ret, strerror(ret)));
         goto done;
     }
-    if ((ret == ENOENT) || (el->num_values == 0)) {
-        DEBUG(SSSDBG_OP_FAILURE, ("version attr not found or has no value\n"));
-    }
-    uint8_t *raw_version_number_value = el[0].values[0].data;
-    gp_gpo->gpo_version_number = (char *) raw_version_number_value;
 
     /* retrieve AD_AT_MACHINE_EXT_NAMES */
     const char *gpo_machine_ext_names = NULL;
@@ -1742,24 +1872,33 @@ ad_gpo_get_gpo_attrs_done(struct tevent_req *subreq)
                ret, strerror(ret)));
         goto done;
     }
-    gp_gpo->gpo_machine_ext_names = talloc_strdup(gp_gpo, gpo_machine_ext_names);
+
+    gp_gpo->gpo_machine_ext_names =
+        talloc_strdup(gp_gpo, gpo_machine_ext_names);
     if (gp_gpo->gpo_machine_ext_names == NULL) {
         ret = ENOMEM;
         goto done;
     }
 
     /* retrieve AD_AT_FUNC_VERSION */
-    ret = sysdb_attrs_get_el(results[0], AD_AT_FUNC_VERSION, &el);
-    if (ret != EOK && ret != ENOENT) {
-        DEBUG(SSSDBG_OP_FAILURE, ("sysdb_attrs_get_el() failed\n"));
+    ret = sysdb_attrs_get_int32_t(results[0], AD_AT_FUNC_VERSION,
+                                  &gp_gpo->gpo_func_version);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              ("sysdb_attrs_get_int32_t failed: [%d](%s)\n",
+               ret, strerror(ret)));
         goto done;
     }
-    if ((ret == ENOENT) || (el->num_values == 0)) {
+
+    /* retrieve AD_AT_FLAGS */
+    ret = sysdb_attrs_get_int32_t(results[0], AD_AT_FLAGS,
+                                  &gp_gpo->gpo_flags);
+    if (ret != EOK) {
         DEBUG(SSSDBG_OP_FAILURE,
-              ("func_version attr not found or has no value\n"));
+              ("sysdb_attrs_get_int32_t failed: [%d](%s)\n",
+               ret, strerror(ret)));
+        goto done;
     }
-    uint8_t *raw_func_version_value = el[0].values[0].data;
-    gp_gpo->gpo_func_version = (char *) raw_func_version_value;
 
     /* retrieve AD_AT_NT_SEC_DESC */
     ret = sysdb_attrs_get_el(results[0], AD_AT_NT_SEC_DESC, &el);
