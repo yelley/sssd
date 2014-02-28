@@ -929,38 +929,6 @@ ad_gpo_populate_som_list(TALLOC_CTX *mem_ctx,
     tmp_dn = target_dn;
     while ((parent_dn = ad_gpo_parent_dn(tmp_dn))){
 
-        /*
-        if (strncasecmp(parent_dn, "OU=", strlen("OU=")) == 0) {
-            som_list[som_idx] = talloc_zero(som_list, struct gp_som);
-            if (som_list[som_idx] == NULL) {
-                ret = ENOMEM;
-                goto done;
-            }
-            som_list[som_idx]->som_dn = talloc_strdup(som_list[som_idx],
-                                                      parent_dn);
-            if (som_list[som_idx]->som_dn == NULL) {
-                ret = ENOMEM;
-                goto done;
-            }
-            som_idx++;
-        } else if (strncasecmp(parent_dn, "DC=", strlen("DC=")) == 0) {
-            som_list[som_idx] = talloc_zero(som_list, struct gp_som);
-            if (som_list[som_idx] == NULL) {
-                ret = ENOMEM;
-                goto done;
-            }
-            som_list[som_idx]->som_dn = talloc_strdup(som_list[som_idx],
-                                                      parent_dn);
-            if (som_list[som_idx]->som_dn == NULL) {
-                ret = ENOMEM;
-                goto done;
-            }
-
-            som_idx++;
-            break;
-        }
-        */
-
         if ((strncasecmp(parent_dn, "OU=", strlen("OU=")) == 0) ||
             (strncasecmp(parent_dn, "DC=", strlen("DC=")) == 0)) {
 
