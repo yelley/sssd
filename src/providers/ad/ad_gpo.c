@@ -1052,24 +1052,21 @@ ad_gpo_access_send(TALLOC_CTX *mem_ctx,
 
     subreq = sdap_id_op_connect_send(state->sdap_op, state, &ret);
     if (subreq == NULL) {
-        ret = ENOMEM;
+        DEBUG(SSSDBG_OP_FAILURE,
+              ("sdap_id_op_connect_send failed: [%d](%s)\n",
+               ret, strerror(ret)));
         goto immediately;
     }
-
     tevent_req_set_callback(subreq, ad_gpo_connect_done, req);
 
-    return req;
+    ret = EOK;
 
  immediately:
 
-    if (ret == EOK) {
-        tevent_req_done(req);
-    } else if (ret != EAGAIN) {
+    if (ret != EOK) {
         tevent_req_error(req, ret);
+        tevent_req_post(req, ev);
     }
-
-    tevent_req_error(req, ret);
-    tevent_req_post(req, ev);
 
     return req;
 }
@@ -1436,14 +1433,11 @@ ad_gpo_process_som_send(TALLOC_CTX *mem_ctx,
 
     tevent_req_set_callback(subreq, ad_gpo_site_name_retrieval_done, req);
 
-    return req;
+    ret = EOK;
 
  immediately:
 
-    if (ret == EOK) {
-        tevent_req_done(req);
-        tevent_req_post(req, ev);
-    } else if (ret != EAGAIN) {
+    if (ret != EOK) {
         tevent_req_error(req, ret);
         tevent_req_post(req, ev);
     }
