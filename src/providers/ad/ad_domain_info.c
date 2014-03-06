@@ -135,16 +135,16 @@ netlogon_get_domain_info(TALLOC_CTX *mem_ctx,
     /* get site name */
     if (response.data.nt5_ex.client_site != NULL
         && response.data.nt5_ex.client_site[0] != '\0') {
-        site = talloc_strdup(mem_ctx, response.data.nt5_ex.client_site);
+        site = response.data.nt5_ex.client_site;
     } else if (response.data.nt5_ex.next_closest_site != NULL
                && response.data.nt5_ex.next_closest_site[0] != '\0') {
-        site = talloc_strdup(mem_ctx, response.data.nt5_ex.next_closest_site);
+        site = response.data.nt5_ex.next_closest_site;
     } else {
         ret = ENOENT;
         goto done;
     }
-    *_site = talloc_strdup(mem_ctx, site);
 
+    *_site = talloc_strdup(mem_ctx, site);
     if (*_site == NULL) {
         DEBUG(SSSDBG_OP_FAILURE, ("talloc_strdup failed.\n"));
         ret = ENOMEM;

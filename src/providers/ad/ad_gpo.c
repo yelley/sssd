@@ -20,7 +20,6 @@
 
   You should have received a copy of the GNU General Public License
   along with this program.  If not, see <http://www.gnu.org/licenses/>.
-12345678901234567890123456789012345678901234567890123456789012345678901234567890            
 */
 
 #include <security/pam_modules.h>
@@ -34,6 +33,9 @@
 #include "providers/ldap/sdap_access.h"
 #include "providers/ldap/sdap_async.h"
 #include "providers/ldap/sdap.h"
+
+#include <ndr.h>
+#include <gen_ndr/security.h>
 
 #define AD_AT_DN "distinguishedName"
 #define AD_AT_UAC "userAccountControl"
@@ -99,7 +101,7 @@ enum ace_eval_status {
  * This function retrieves the SIDs corresponding to the input user and returns
  * the user_sid, group_sids, and group_size in their respective output params.
  *
- * Note: since pam_authenticate() must complete successfully before the
+ * Note: since authentication must complete successfully before the
  * gpo access checks are called, we can safely assume that the user/computer has
  * been authenticated. As such, this function always adds the
  * AD_AUTHENTICATED_USERS_SID to the group_sids.
@@ -112,15 +114,23 @@ ad_gpo_get_sids(TALLOC_CTX *mem_ctx,
                 const char ***_group_sids,
                 int *_group_size)
 {
+    TALLOC_CTX *tmp_ctx = NULL;
     struct ldb_result *res;
     int ret = 0;
     int i = 0;
-    int numgroupsids = 0;
-    const char *mysid = NULL;
-    const char **groupsids = NULL;
+    int num_group_sids = 0;
+    const char *user_sid = NULL;
+    const char *group_sid = NULL;
+    const char **group_sids = NULL;
+
+    tmp_ctx = talloc_new(NULL);
+    if (tmp_ctx == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
 
     /* first result from sysdb_initgroups is user_sid; rest are group_sids */
-    ret = sysdb_initgroups(mem_ctx, domain, user, &res);
+    ret = sysdb_initgroups(tmp_ctx, domain, user, &res);
     if (ret != EOK) {
         DEBUG(SSSDBG_OP_FAILURE,
               ("sysdb_initgroups failed: [%d](%s)\n",
@@ -128,25 +138,41 @@ ad_gpo_get_sids(TALLOC_CTX *mem_ctx,
         return ret;
     }
 
-    mysid = ldb_msg_find_attr_as_string(res->msgs[0], 
+    user_sid = ldb_msg_find_attr_as_string(res->msgs[0], 
                                         SYSDB_SID_STR, NULL);
-    numgroupsids = (res->count) - 1;
+    num_group_sids = (res->count) - 1;
 
-    /* we use (numgroupsids + 1) to leave room for AD_AUTHENTICATED_USERS_SID */
-    groupsids = malloc((numgroupsids + 1) * sizeof(char*));
-    for (i = 0; i < numgroupsids; i++) {
-        groupsids[i] = malloc(SID_MAX_LEN * sizeof(char));
-        groupsids[i] = ldb_msg_find_attr_as_string(res->msgs[i+1], 
-                                                   SYSDB_SID_STR, NULL);
+    /* include space for AD_AUTHENTICATED_USERS_SID and NULL */
+    group_sids = talloc_array(tmp_ctx, char *, num_group_sids + 1 + 1);
+    if (group_sids == NULL) {
+        ret = ENOMEM;
+        goto done;
     }
 
-    groupsids[i] = malloc(SID_MAX_LEN * sizeof(char));
-    groupsids[i] = AD_AUTHENTICATED_USERS_SID;
+    for (i = 0; i < num_group_sids; i++) {
+        group_sid = ldb_msg_find_attr_as_string(res->msgs[i+1], 
+                                                SYSDB_SID_STR, NULL);
+        if (group_sid == NULL) {
+            continue;
+        }
+
+        group_sids[i] = talloc_strdup(group_sids, group_sid);
+        if (group_sids[i] == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+    }
+    group_sids[i++] = AD_AUTHENTICATED_USERS_SID;
+    group_sids[i] = NULL;
     
-    *_group_size = numgroupsids + 1;
-    *_group_sids = groupsids;
-    *_user_sid = mysid;
+    *_group_size = num_group_sids + 1;
+    *_group_sids = talloc_steal(mem_ctx, group_sids);
+    *_user_sid = talloc_strdup(mem_ctx, user_sid);
     return EOK;
+
+ done:
+    talloc_free(tmp_ctx);
+    return ret;
 }
 
 /* 
@@ -456,7 +482,7 @@ ad_gpo_filter_gpo_list(TALLOC_CTX *mem_ctx,
 }
 
 /* 
- * This function populates the _cse_list output parameter by parsing the
+ * This function populates the _cse_guid_list output parameter by parsing the
  * input raw_machine_ext_names_value into an array of cse_guid strings.
  *
  * The raw_machine_ext_names_value is a single string in the following format:
@@ -468,16 +494,22 @@ ad_gpo_parse_machine_ext_names(TALLOC_CTX *mem_ctx,
                                char ***_cse_guid_list)
 {
     TALLOC_CTX *tmp_ctx = NULL;
-    char *copy;
+    char *ptr;
     char *first;
     char *last;
     char *cse_guid;
     char *tool_guid;
-    char delim = ']';
+    const char delim = ']';
     char **cse_guid_list;
     int i;
     int ret;
     int cse_guid_count = 0;
+
+    if (raw_machine_ext_names_value == NULL || 
+        *raw_machine_ext_names_value == '\0' || 
+        _cse_guid_list == NULL) {
+        return EINVAL;
+    }
 
     tmp_ctx = talloc_new(NULL);
     if (tmp_ctx == NULL) {
@@ -485,15 +517,15 @@ ad_gpo_parse_machine_ext_names(TALLOC_CTX *mem_ctx,
         goto done;
     }
 
-    copy = raw_machine_ext_names_value;
-    if (copy == NULL) {    
+    ptr = raw_machine_ext_names_value;
+    if (ptr == NULL) {    
         ret = ENOMEM;
         goto done;
     }
 
-    while ((copy = strchr(copy, delim))) {
-        if (copy == NULL) break;
-        copy++;
+    while ((ptr = strchr(ptr, delim))) {
+        if (ptr == NULL) break;
+        ptr++;
         cse_guid_count++;
     }
 
@@ -508,9 +540,9 @@ ad_gpo_parse_machine_ext_names(TALLOC_CTX *mem_ctx,
         goto done;
     }
 
-    copy = raw_machine_ext_names_value;
+    ptr = raw_machine_ext_names_value;
     for (i = 0; i < cse_guid_count; i++) {
-        first = copy + 1;
+        first = ptr + 1;
         last = strchr(first, delim);
         if (last == NULL) {
             break;
@@ -525,7 +557,7 @@ ad_gpo_parse_machine_ext_names(TALLOC_CTX *mem_ctx,
         }
         *tool_guid = '\0';
         cse_guid_list[i] = talloc_strdup(cse_guid_list, cse_guid);
-        copy = last;
+        ptr = last;
     }
     cse_guid_list[i] = NULL;
 
@@ -758,18 +790,24 @@ ad_gpo_populate_gplink_list(TALLOC_CTX *mem_ctx,
                             bool allow_enforced_only) 
 {
     TALLOC_CTX *tmp_ctx = NULL;
-    char *copy;
+    char *ptr;
     char *first;
     char *last;
     char *dn;
     char *gplink_options;
-    char delim = ']';
+    const char delim = ']';
     struct gp_gplink **gplink_list;
     int i;
     int ret;
     int gplink_number;
     int gplink_count = 0;
     int num_enabled = 0;
+
+    if (raw_gplink_value == NULL || 
+        *raw_gplink_value == '\0' ||
+        _gplink_list == NULL) {
+        return EINVAL;
+    }
 
     DEBUG(SSSDBG_TRACE_ALL, ("som_dn: %s\n", som_dn));
     tmp_ctx = talloc_new(NULL);
@@ -778,15 +816,11 @@ ad_gpo_populate_gplink_list(TALLOC_CTX *mem_ctx,
         goto done;
     }
 
-    copy = raw_gplink_value;
-    if (copy == NULL) {    
-        ret = ENOMEM;
-        goto done;
-    }
+    ptr = raw_gplink_value;
 
-    while ((copy = strchr(copy, delim))) {
-        if (copy == NULL) break;
-        copy++;
+    while ((ptr = strchr(ptr, delim))) {
+        if (ptr == NULL) break;
+        ptr++;
         gplink_count++;
     }
 
@@ -802,9 +836,9 @@ ad_gpo_populate_gplink_list(TALLOC_CTX *mem_ctx,
     }
 
     num_enabled = 0;
-    copy = raw_gplink_value;
+    ptr = raw_gplink_value;
     for (i = 0; i < gplink_count; i++) {
-        first = copy + 1;
+        first = ptr + 1;
         last = strchr(first, delim);
         if (last == NULL) {
             break;
@@ -829,14 +863,14 @@ ad_gpo_populate_gplink_list(TALLOC_CTX *mem_ctx,
         if ((gplink_number == 1) || (gplink_number ==3)){
             /* ignore flag is set */
             DEBUG(SSSDBG_TRACE_ALL, ("ignored gpo skipped\n"));
-            copy = last;
+            ptr = last;
             continue;
         }
 
         if (allow_enforced_only && (gplink_number == 0)) {
             /* unenforced flag is set; only enforced gpos allowed */
             DEBUG(SSSDBG_TRACE_ALL, ("unenforced gpo skipped\n"));
-            copy = last;
+            ptr = last;
             continue;
         }
 
@@ -864,7 +898,7 @@ ad_gpo_populate_gplink_list(TALLOC_CTX *mem_ctx,
             goto done;
         }
 
-        copy = last;
+        ptr = last;
     }
     gplink_list[num_enabled] = NULL;
 
@@ -875,6 +909,7 @@ ad_gpo_populate_gplink_list(TALLOC_CTX *mem_ctx,
     talloc_free(tmp_ctx);
     return ret;
 }
+
 
 /* 
  * This function populates the _som_list output parameter by parsing the input
@@ -1955,6 +1990,8 @@ ad_gpo_get_gpo_attrs_done(struct tevent_req *subreq)
     if ((ret == ENOENT) || (el->num_values == 0)) {
         DEBUG(SSSDBG_OP_FAILURE,
               ("machine_ext_names not found or has no value\n"));
+        ret = ENOENT;
+        goto done;
     }
 
     uint8_t *raw_machine_ext_names = el[0].values[0].data;
@@ -2005,6 +2042,8 @@ ad_gpo_get_gpo_attrs_done(struct tevent_req *subreq)
     if ((ret == ENOENT) || (el->num_values == 0)) {
         DEBUG(SSSDBG_OP_FAILURE,
               ("nt_sec_desc attribute not found or has no value\n"));
+        ret = ENOENT;
+        goto done;
     }
 
     ret = ad_gpo_parse_sd(gp_gpo, el[0].values[0].data, el[0].values[0].length,

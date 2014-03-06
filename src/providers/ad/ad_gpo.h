@@ -23,9 +23,6 @@
 #ifndef AD_GPO_H_
 #define AD_GPO_H_
 
-#include <ndr.h>
-#include <gen_ndr/security.h>
-
 /* 
  * This pair of functions provides client-side GPO processing.
  *
