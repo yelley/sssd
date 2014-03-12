@@ -144,7 +144,7 @@ ad_gpo_get_sids(TALLOC_CTX *mem_ctx,
     num_group_sids = (res->count) - 1;
 
     /* include space for AD_AUTHENTICATED_USERS_SID and NULL */
-    group_sids = talloc_array(tmp_ctx, char *, num_group_sids + 1 + 1);
+    group_sids = talloc_array(tmp_ctx, const char *, num_group_sids + 1 + 1);
     if (group_sids == NULL) {
         ret = ENOMEM;
         goto done;
@@ -1347,11 +1347,10 @@ ad_gpo_process_gpo_done(struct tevent_req *subreq)
     struct gp_gpo **candidate_gpos = NULL;
     int num_candidate_gpos = 0;
     int i = 0;
-    int j = 0;
-
+ 
     req = tevent_req_callback_data(subreq, struct tevent_req);
     state = tevent_req_data(req, struct ad_gpo_access_state);
-    ret = ad_gpo_process_gpo_recv(subreq, state, &gpo_list);
+    ret = ad_gpo_process_gpo_recv(subreq, state, &candidate_gpos, &num_candidate_gpos);
 
     talloc_zfree(subreq);
 
